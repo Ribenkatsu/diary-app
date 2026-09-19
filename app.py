@@ -105,129 +105,54 @@ def restore_logged_in_user(client):
 
 
 # =========================================
-# メール確認後のURLトークン処理
+# メール確認後のトークンハッシュ処理
 # =========================================
 
-AUTH_REDIRECT_HTML = """
-<div id="auth-redirect-bridge" aria-hidden="true"></div>
-"""
+def consume_email_confirmation(client):
+    """
+    Supabase の確認メールを token_hash 方式で処理します。
 
-AUTH_REDIRECT_JS = """
-export default function(component) {
-    const { setTriggerValue } = component;
+    URL例:
+    https://ribenkatsudiary.streamlit.app/?token_hash=...&type=email
 
-    // Supabase の Implicit Flow では、確認メール後の認証情報が
-    // URL の #access_token=...&refresh_token=... に入ります。
-    const hash = window.location.hash || "";
+    access_token / refresh_token をURLへ載せず、
+    token_hash を Supabase 側で検証してセッションを作成します。
+    """
+    token_hash = st.query_params.get("token_hash")
+    verification_type = st.query_params.get("type")
 
-    if (!hash || hash === "#") {
-        return;
-    }
+    if not token_hash:
+        return None
 
-    const params = new URLSearchParams(
-        hash.startsWith("#") ? hash.slice(1) : hash
-    );
+    # 今回の確認メールでは type=email を使います。
+    if verification_type != "email":
+        st.query_params.clear()
+        st.error("認証リンクの形式が正しくありません。もう一度確認メールを開いてください。")
+        return None
 
-    const accessToken = params.get("access_token");
-    const refreshToken = params.get("refresh_token");
-    const error = params.get("error");
-    const errorDescription = params.get("error_description");
-
-    const hasAuthResult = Boolean(
-        (accessToken && refreshToken) || error || errorDescription
-    );
-
-    if (!hasAuthResult) {
-        return;
-    }
-
-    // 先にURLからトークンを消します。
-    // replaceState なので、トークン付きURLを履歴に追加しません。
-    const cleanUrl = `${window.location.pathname}${window.location.search}`;
-    window.history.replaceState({}, document.title, cleanUrl);
-
-    if (accessToken && refreshToken) {
-        setTriggerValue(
-            "auth_redirect",
-            JSON.stringify({
-                access_token: accessToken,
-                refresh_token: refreshToken
-            })
-        );
-        return;
-    }
-
-    setTriggerValue(
-        "auth_redirect",
-        JSON.stringify({
-            error: error || "auth_redirect_error",
-            error_description: errorDescription || "認証リンクを処理できませんでした。"
+    try:
+        response = client.auth.verify_otp({
+            "token_hash": str(token_hash),
+            "type": "email",
         })
-    );
-}
-"""
-
-
-auth_redirect_component = st.components.v2.component(
-    "diary_auth_redirect_cleanup_v1",
-    html=AUTH_REDIRECT_HTML,
-    css="#auth-redirect-bridge { display: none; }",
-    js=AUTH_REDIRECT_JS,
-)
-
-
-def consume_auth_redirect(client):
-    """
-    Supabase の確認メールから戻ったときだけ、
-    URLフラグメント内のトークンを受け取りセッション化します。
-    トークン自体はJavaScript側で即座にURLから削除します。
-    """
-    result = auth_redirect_component(
-        key="auth_redirect_bridge",
-        on_auth_redirect_change=lambda: None,
-        height=0,
-        width="stretch",
-    )
-
-    raw_payload = getattr(result, "auth_redirect", None)
-
-    if not raw_payload:
-        return None
-
-    try:
-        payload = json.loads(raw_payload)
-    except (TypeError, json.JSONDecodeError):
-        st.error("認証情報を読み取れませんでした。もう一度ログインしてください。")
-        return None
-
-    if payload.get("error"):
-        description = payload.get("error_description") or "認証リンクの処理に失敗しました。"
-        st.error(description)
-        return None
-
-    access_token = payload.get("access_token")
-    refresh_token = payload.get("refresh_token")
-
-    if not access_token or not refresh_token:
-        return None
-
-    try:
-        response = client.auth.set_session(
-            access_token,
-            refresh_token,
-        )
 
         session = get_session_from_response(response)
+
+        if session is None:
+            st.query_params.clear()
+            st.error("メール確認は完了しましたが、ログイン情報を取得できませんでした。")
+            return None
+
         save_auth_session(session)
 
-        user_response = client.auth.get_user()
-        return getattr(user_response, "user", None)
+        # token_hash もURLに残さないよう、確認後すぐ消します。
+        st.query_params.clear()
+        st.rerun()
 
-    except Exception:
-        st.error(
-            "メール確認は完了しましたが、ログイン状態を作れませんでした。"
-            " ログイン画面からもう一度ログインしてください。"
-        )
+    except Exception as error:
+        st.query_params.clear()
+        st.error("確認メールの認証に失敗しました。リンクの有効期限が切れている可能性があります。")
+        st.code(str(error))
         return None
 
 
@@ -1218,9 +1143,9 @@ def rich_editor(
 
 supabase = create_supabase_client()
 
-# 確認メールから戻った直後は、URLの認証トークンを先に受け取ります。
+# 確認メールから戻った直後は、URLの token_hash を先に検証します。
 # 通常アクセス時は何もせず、保存済みセッションを復元します。
-current_user = consume_auth_redirect(supabase)
+current_user = consume_email_confirmation(supabase)
 
 if current_user is None:
     current_user = restore_logged_in_user(supabase)
